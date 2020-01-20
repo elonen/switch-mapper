@@ -1,0 +1,3 @@
+pyinstaller
+pyinstaller_setuptools
+pysnmp
