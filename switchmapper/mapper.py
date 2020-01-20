@@ -165,7 +165,7 @@ def process_hosts(root_bridge_ips: Iterable[str], community: str,
 
         all_bridge_macs.add(lldpLocChassisId)  # chassis id looks like a MAC and some switches use it for all their ports
 
-        print(" - Getting local info...")
+        print(" - Getting local info...", file=sys.stderr)
 
         # Check that it's a bridge
         lldpLocSysCapSupported = int(tuple(walk(host, '1.0.8802.1.1.2.1.3.5', 'hex').values())[-1], 16)
@@ -194,7 +194,7 @@ def process_hosts(root_bridge_ips: Iterable[str], community: str,
             ports=defaultdict(lambda: Port(name='', speed=0, remote_macs=[], remote_ips=[], local_mac=None, interlink=False)))
 
         # Find IP addresses to neighbor bridges
-        print(" - Getting neighbors...")
+        print(" - Getting neighbors...", file=sys.stderr)
         lldpRemManAddrTable = walk(host, '1.0.8802.1.1.2.1.4.2.1.4', 'preview')
         for oid, port_id in lldpRemManAddrTable.items():
             time_mark, local_port_num, rem_index, addr_subtype, *rest = split_numbers(oid)
@@ -203,7 +203,7 @@ def process_hosts(root_bridge_ips: Iterable[str], community: str,
                     ips_to_visit.add(read_ipv4_from_oid_tail(oid))
 
         # Port names
-        print(" - Getting ports...")
+        print(" - Getting ports...", file=sys.stderr)
         for port, name in walk(host, '1.3.6.1.2.1.31.1.1.1.1', 'any').items():  # ifName
             this_bridge.ports[int(port)].name = name
         # Port speeds
@@ -215,14 +215,14 @@ def process_hosts(root_bridge_ips: Iterable[str], community: str,
             all_bridge_macs.add(mac)
 
         # Read ARP table
-        print(" - Reading device ARP table...")
+        print(" - Reading device ARP table...", file=sys.stderr)
         atPhysAddress = walk(host, '1.3.6.1.2.1.3.1.1.2', 'hex')
         for oid, mac in atPhysAddress.items():
             ip = read_ipv4_from_oid_tail(oid, with_len=False)
             arp[ip] = mac
 
         # Map remote (learned) MACs to ports
-        print(" - Getting MACs for ports...")
+        print(" - Getting MACs for ports...", file=sys.stderr)
         macs_per_port = defaultdict(set)
         ports_per_mac = defaultdict(set)
         dot1qTpFdbPort = walk(host, '1.3.6.1.2.1.17.7.1.2.2.1.2', 'int')
@@ -246,7 +246,7 @@ def process_hosts(root_bridge_ips: Iterable[str], community: str,
         ##is_bridge = (lldpLocSysCapSupported & 32) != 0
         #print(lldpRemSysCapSupported,  file=sys.stderr)
 
-        print(" - Getting remotes...")
+        print(" - Getting remotes...", file=sys.stderr)
         lldpRemChassisId = walk(host, '1.0.8802.1.1.2.1.4.1.1.5', 'hex')
         for k, chassis_id in lldpRemChassisId.items():
             time_mark, port, idx = split_numbers(k)
@@ -276,6 +276,7 @@ def process_hosts(root_bridge_ips: Iterable[str], community: str,
             for p in b.ports.values():
                 for mac in [*p.remote_macs, p.local_mac, b.chassis_id]:
                     ips.extend(rarp.get(mac) or [])
+        ips = set(ips)
 
         def fetch_name(ip):
             try:
@@ -284,19 +285,19 @@ def process_hosts(root_bridge_ips: Iterable[str], community: str,
                 return [None, [], [ip]]
 
         if resolve_hostnames:
-            print(f"Resolving hostnames for {len(ips)} IP addresses...")
+            print(f"Resolving hostnames for {len(ips)} IP addresses...", file=sys.stderr)
             for res in executor.map(fetch_name, ips):
                 for ip in res[2]:
                     if res[0]:
                         ip_to_hostname[ip] = res[0]
 
     # Cleanup and extend some values
-    print("Cleaning up and extending...")
+    print("Cleaning up and extending...", file=sys.stderr)
     for b in bridges.values():
-        print(" - Bridge {b.name}...")
+        print(f" - Bridge {b.name}...", file=sys.stderr)
 
         # Replace macs with NeighborInfos in neighbor lists
-        print("   - extending NeighborInfos...")
+        print("   - extending NeighborInfos...", file=sys.stderr)
         neigh_infos = []
         for chassis_id in b.neighbors:
             ni = NeighborInfo(is_bridge=False, name='', ips=[], macs=[chassis_id], chassis_id=chassis_id)
@@ -316,11 +317,11 @@ def process_hosts(root_bridge_ips: Iterable[str], community: str,
 
         # Delete unused ports from results
         if not all_ports:
-            print("   - filtering unused ports...")
+            print("   - filtering unused ports...", file=sys.stderr)
             b.ports = {k: v for k, v in b.ports.items() if (v.remote_macs or v.remote_ips)}
 
         # Update port contents
-        print("   - updating port contents...")
+        print("   - updating port contents...", file=sys.stderr)
         for p in b.ports.values():
             # Mark all ports with bridge management addresses as "interlink"
             for bm in all_bridge_macs:
@@ -332,7 +333,7 @@ def process_hosts(root_bridge_ips: Iterable[str], community: str,
             p.remote_ips = sorted(list(set(p.remote_ips)))  # prune duplicates
 
     # Sort for nicer output  TODO: "natural sorting" for IPs
-    print("Sort ARP tables...")
+    print("Sort ARP tables...", file=sys.stderr)
     arp = dict(sorted(arp.items()))
     rarp = dict(sorted(rarp.items()))
 
