@@ -1,7 +1,9 @@
+from concurrent.futures import ThreadPoolExecutor as PoolExecutor
 from typing import List, Set, Dict, Union, Tuple, Iterable
 from collections import defaultdict
-import sys, pprint, json, time, argparse
+import sys, pprint, json, time, argparse, socket
 from functools import partial
+from itertools import chain
 
 import pysnmp.hlapi as hlapi
 import pysnmp.proto.rfc1902 as rfc1902
@@ -91,7 +93,6 @@ class Port(HashableBase):
     remote_macs: List[str]
     remote_ips: List[str]
 
-
 class NeighborInfo(HashableBase):
     name: str
     chassis_id: str
@@ -116,13 +117,18 @@ class Bridge(HashableBase):
 
 
 
-def process_hosts(root_bridge_ips: Iterable[str], community: str, do_recurse = False, all_ports = False) -> \
-        Tuple[Dict[str, Bridge], Dict[str, str], Dict[str, List[str]], str]:
+def process_hosts(root_bridge_ips: Iterable[str], community: str,
+                  do_recurse=False, all_ports=False, resolve_hostnames=True) -> \
+        Tuple[Dict[str, Bridge], Dict[str, str], Dict[str, List[str]], Dict[str, str], str]:
     """
     Recursively query LLDP infos through SNMP from 'root_bridge_ips' and their neighbors.
 
+    :param community: SNMP Community to use for connections
+    :param do_recurse: Recurse to neighboring bridge devices?
+    :param all_ports: Show all ports, not just active ones?
+    :param resolve_hostnames: Resolve hostnames for IP addresses? (slow, albeit parallelized process)
     :param root_bridge_ips: List of IP addresses to hosts that recursion should start from
-    :return: (List of bridges, ARP table, Reverse ARP table, results as JSON)
+    :return: (List of bridges, ARP table, Reverse ARP table, IP->Hostname, Results as JSON)
     """
     ips_to_visit = set(list(root_bridge_ips))
     visited_chassis_ids = set()
@@ -140,7 +146,7 @@ def process_hosts(root_bridge_ips: Iterable[str], community: str, do_recurse = F
             continue
         visited_ips.add(host)
 
-        print("VISITING", host,  file=sys.stderr)
+        print("VISITING", host, file=sys.stderr)
 
         # Skip if chassis ID not found or has already been seen
         try:
@@ -158,6 +164,8 @@ def process_hosts(root_bridge_ips: Iterable[str], community: str, do_recurse = F
         visited_chassis_ids.add(lldpLocChassisId)
 
         all_bridge_macs.add(lldpLocChassisId)  # chassis id looks like a MAC and some switches use it for all their ports
+
+        print(" - Getting local info...")
 
         # Check that it's a bridge
         lldpLocSysCapSupported = int(tuple(walk(host, '1.0.8802.1.1.2.1.3.5', 'hex').values())[-1], 16)
@@ -186,6 +194,7 @@ def process_hosts(root_bridge_ips: Iterable[str], community: str, do_recurse = F
             ports=defaultdict(lambda: Port(name='', speed=0, remote_macs=[], remote_ips=[], local_mac=None, interlink=False)))
 
         # Find IP addresses to neighbor bridges
+        print(" - Getting neighbors...")
         lldpRemManAddrTable = walk(host, '1.0.8802.1.1.2.1.4.2.1.4', 'preview')
         for oid, port_id in lldpRemManAddrTable.items():
             time_mark, local_port_num, rem_index, addr_subtype, *rest = split_numbers(oid)
@@ -194,6 +203,7 @@ def process_hosts(root_bridge_ips: Iterable[str], community: str, do_recurse = F
                     ips_to_visit.add(read_ipv4_from_oid_tail(oid))
 
         # Port names
+        print(" - Getting ports...")
         for port, name in walk(host, '1.3.6.1.2.1.31.1.1.1.1', 'any').items():  # ifName
             this_bridge.ports[int(port)].name = name
         # Port speeds
@@ -205,12 +215,14 @@ def process_hosts(root_bridge_ips: Iterable[str], community: str, do_recurse = F
             all_bridge_macs.add(mac)
 
         # Read ARP table
+        print(" - Reading device ARP table...")
         atPhysAddress = walk(host, '1.3.6.1.2.1.3.1.1.2', 'hex')
         for oid, mac in atPhysAddress.items():
             ip = read_ipv4_from_oid_tail(oid, with_len=False)
             arp[ip] = mac
 
         # Map remote (learned) MACs to ports
+        print(" - Getting MACs for ports...")
         macs_per_port = defaultdict(set)
         ports_per_mac = defaultdict(set)
         dot1qTpFdbPort = walk(host, '1.3.6.1.2.1.17.7.1.2.2.1.2', 'int')
@@ -234,11 +246,10 @@ def process_hosts(root_bridge_ips: Iterable[str], community: str, do_recurse = F
         ##is_bridge = (lldpLocSysCapSupported & 32) != 0
         #print(lldpRemSysCapSupported,  file=sys.stderr)
 
+        print(" - Getting remotes...")
         lldpRemChassisId = walk(host, '1.0.8802.1.1.2.1.4.1.1.5', 'hex')
-        remote_bridges = []
         for k, chassis_id in lldpRemChassisId.items():
             time_mark, port, idx = split_numbers(k)
-            #all_bridge_macs.add(chassis_id)
             if chassis_id not in this_bridge.neighbors:
                 this_bridge.neighbors.append(chassis_id)
 
@@ -256,10 +267,36 @@ def process_hosts(root_bridge_ips: Iterable[str], community: str, do_recurse = F
     for k, v in arp.items():
         rarp.setdefault(v, set()).add(k)
 
+    # Find hostnames for ip addresses using multiple threads (the query is VERY slow)
+    ip_to_hostname = {}
+    with PoolExecutor(max_workers=50) as executor:
+        ips = []
+        for b in bridges.values():
+            ips.extend(b.ip_addresses)
+            for p in b.ports.values():
+                for mac in [*p.remote_macs, p.local_mac, b.chassis_id]:
+                    ips.extend(rarp.get(mac) or [])
+
+        def fetch_name(ip):
+            try:
+                return socket.gethostbyaddr(ip)
+            except (socket.gaierror, socket.herror):
+                return [None, [], [ip]]
+
+        if resolve_hostnames:
+            print(f"Resolving hostnames for {len(ips)} IP addresses...")
+            for res in executor.map(fetch_name, ips):
+                for ip in res[2]:
+                    if res[0]:
+                        ip_to_hostname[ip] = res[0]
+
     # Cleanup and extend some values
+    print("Cleaning up and extending...")
     for b in bridges.values():
+        print(" - Bridge {b.name}...")
 
         # Replace macs with NeighborInfos in neighbor lists
+        print("   - extending NeighborInfos...")
         neigh_infos = []
         for chassis_id in b.neighbors:
             ni = NeighborInfo(is_bridge=False, name='', ips=[], macs=[chassis_id], chassis_id=chassis_id)
@@ -272,15 +309,18 @@ def process_hosts(root_bridge_ips: Iterable[str], community: str, do_recurse = F
             for ips in ((rarp.get(m) or []) for m in ni.macs):
                 ni.ips.extend(ips)
             ni.ips = list(set(ni.ips))
+            ni.name = ni.name or ip_to_hostname.get([*ni.ips, ''][0]) or ''
             neigh_infos.append(ni)
 
         b.neighbors = neigh_infos
 
         # Delete unused ports from results
         if not all_ports:
+            print("   - filtering unused ports...")
             b.ports = {k: v for k, v in b.ports.items() if (v.remote_macs or v.remote_ips)}
 
         # Update port contents
+        print("   - updating port contents...")
         for p in b.ports.values():
             # Mark all ports with bridge management addresses as "interlink"
             for bm in all_bridge_macs:
@@ -292,6 +332,7 @@ def process_hosts(root_bridge_ips: Iterable[str], community: str, do_recurse = F
             p.remote_ips = sorted(list(set(p.remote_ips)))  # prune duplicates
 
     # Sort for nicer output  TODO: "natural sorting" for IPs
+    print("Sort ARP tables...")
     arp = dict(sorted(arp.items()))
     rarp = dict(sorted(rarp.items()))
 
@@ -299,10 +340,11 @@ def process_hosts(root_bridge_ips: Iterable[str], community: str, do_recurse = F
         'timestamp': time.time(),
         'bridges':  [b.as_dict() for b in bridges.values()],
         'arp': arp,
-        'rarp': {k: list(v) for k, v in rarp.items()}
+        'rarp': {k: list(v) for k, v in rarp.items()},
+        'ip_to_hostname': ip_to_hostname
     }
 
-    return bridges, arp, rarp, json.dumps(res_dict, indent=4)
+    return bridges, arp, rarp, ip_to_hostname, json.dumps(res_dict, indent=4)
 
 
 def main():
@@ -311,13 +353,14 @@ def main():
     parser.add_argument('ip', nargs='+', help="Server to start query recursion from.")
     parser.add_argument('-c', '--community', dest='snmp_community', type=str, default='public', help='SNMP community')
     parser.add_argument('-nr', '--norec', dest='no_recursion', action='store_true', default=False, help="Don't recurse; visit only given IPs.")
+    parser.add_argument('-nh', '--nohostnames', dest='no_hostnames', action='store_true', default=False, help="Don't resolve hostnames.")
     parser.add_argument('-ap', '--all-ports', dest='all_ports', action='store_true', default=False, help="Show empty/disconnected ports, too.")
     parsed = parser.parse_args()
 
-    bridges, arp, rarp, json_res = process_hosts(
-        parsed.ip, community=parsed.snmp_community, do_recurse=not parsed.no_recursion, all_ports=parsed.all_ports)
+    bridges, arp, rarp, ip_to_hostname, json_res = process_hosts(
+        parsed.ip, community=parsed.snmp_community, do_recurse=not parsed.no_recursion,
+        all_ports=parsed.all_ports, resolve_hostnames=not parsed.no_hostnames)
     print(json_res)
-
 
 if __name__ == "__main__":
     main()

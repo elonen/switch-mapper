@@ -1,6 +1,7 @@
 # switch-mapper
 
-Recursive ethernet switch mapper using SNMP/LLDP.
+Recursive Ethernet switch mapper using SNMP/LLDP.
+Also resolves IPv4 addresses and hostnames (no IPv6 support currently).
 Outputs JSON.
 
 ## Installing
